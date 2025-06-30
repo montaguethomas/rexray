@@ -870,6 +870,7 @@ func (d *driver) SnapshotRemove(
 ///////////////////////////////////////////////////////////////////////
 /////////        HELPER FUNCTIONS SPECIFIC TO PROVIDER        /////////
 ///////////////////////////////////////////////////////////////////////
+
 // getVolume searches for and returns volumes matching criteria
 func (d *driver) getVolume(
 	ctx types.Context,
@@ -957,8 +958,11 @@ func (d *driver) toTypesVolume(
 					deviceName = strings.Replace(
 						*attachment.Device, "sd",
 						d.deviceRange.NextDeviceInfo.Prefix, 1)
-					// Keep device name if it is found in local devices
-					if _, ok := ld.DeviceMap[deviceName]; !ok {
+					if _, ok := ld.DeviceMap[deviceName]; ok {
+						// Use local device alias
+						deviceName = ld.DeviceMap[deviceName]
+					} else {
+						// Clear device name if it is not found in local devices
 						deviceName = ""
 					}
 				}
