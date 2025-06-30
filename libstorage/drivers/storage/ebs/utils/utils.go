@@ -6,17 +6,17 @@ import (
 	"github.com/rexray/rexray/libstorage/api/types"
 	"github.com/rexray/rexray/libstorage/drivers/storage/ebs"
 
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/aws/aws-sdk-go/aws/session"
 )
 
 // IsEC2Instance returns a flag indicating whether the executing host is an EC2
 // instance based on whether or not the metadata URL can be accessed.
 func IsEC2Instance(ctx types.Context) (bool, error) {
 	sess, err := session.NewSession()
-        if err != nil {
-            return false, err
-        }
+	if err != nil {
+		return false, err
+	}
 	_, err = ec2metadata.New(sess).GetMetadata("instance-id")
 	if err != nil {
 		return false, err
@@ -37,7 +37,7 @@ func InstanceID(
 
 	sess, err := session.NewSession()
 	if err != nil {
-	    return nil, err
+		return nil, err
 	}
 	iid, err := ec2metadata.New(sess).GetInstanceIdentityDocument()
 	if err != nil {
@@ -59,7 +59,7 @@ func BlockDevices(ctx types.Context) ([]byte, error) {
 
 	sess, err := session.NewSession()
 	if err != nil {
-	    return nil, err
+		return nil, err
 	}
 	buf, err := ec2metadata.New(sess).GetMetadata("block-device-mapping/")
 	if err != nil {
@@ -75,7 +75,7 @@ func BlockDeviceName(
 
 	sess, err := session.NewSession()
 	if err != nil {
-	    return nil, err
+		return nil, err
 	}
 	buf, err := ec2metadata.New(sess).GetMetadata(fmt.Sprintf("block-device-mapping/%s", device))
 	if err != nil {
