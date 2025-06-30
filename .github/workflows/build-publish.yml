@@ -1,0 +1,148 @@
+name: Build & Publish
+
+on:
+  push:
+    branches: [main]
+    tags: [v*.*.*]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  DOCKER: 0
+  PROG: rexray
+
+jobs:
+  build:
+    if: false
+    runs-on: ubuntu-latest
+    env:
+      DRIVER: ${{ matrix.driver }}
+      GOARCH: ${{ matrix.arch }}
+      GOOS: ${{ matrix.os }}
+      XGOARCH: ${{ matrix.arch }}
+      XGOOS: ${{ matrix.os }}
+    strategy:
+      matrix:
+        arch: [amd64, arm, arm64]
+        driver:
+        - ""
+        - azureud
+        - cinder
+        - csi-nfs
+        - dobs
+        - ebs
+        - efs
+        - gcepd
+        - isilon
+        - rbd
+        - s3fs
+        - scaleio
+        go-version: [1.24]
+        os: [linux]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        check-latest: true
+        go-version: ${{ matrix.go-version }}
+
+    - name: Build
+      run: |
+        make
+        md5sum $PROG
+        ls -al $PROG
+        file $PROG
+        [[ "$GOARCH" == "amd64" ]] && ./$PROG version
+
+  docker-plugin:
+    runs-on: ubuntu-latest
+    env:
+      DOCKER_PLUGIN_ROOT: "${REGISTRY}/${IMAGE_NAME}"
+      DOCKER_PLUGIN_TYPE: stable
+      DRIVER: ${{ matrix.driver }}
+      GOARCH: ${{ matrix.arch }}
+      GOOS: ${{ matrix.os }}
+      XGOARCH: ${{ matrix.arch }}
+      XGOOS: ${{ matrix.os }}
+    strategy:
+      matrix:
+        arch: [amd64]
+        driver:
+        #- azureud
+        #- cinder
+        #- csi-nfs
+        #- dobs
+        - ebs
+        - efs
+        #- gcepd
+        #- isilon
+        #- rbd
+        - s3fs
+        #- scaleio
+        go-version: [1.24]
+        os: [linux]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # Login against a Docker registry except on PR
+    # https://github.com/docker/login-action
+    - name: Log into registry ${{ env.REGISTRY }}
+      if: github.event_name != 'pull_request'
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        check-latest: true
+        go-version: ${{ matrix.go-version }}
+
+    - name: Build
+      run: |
+        make
+        md5sum $PROG
+        ls -al $PROG
+        file $PROG
+        [[ "$GOARCH" == "amd64" ]] && ./$PROG version
+
+    - name: Build Docker Plugin
+      run: make build-docker-plugin
+
+    - name: Push Docker Plugin
+      run: make push-docker-plugin
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        go-version: [1.24]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        check-latest: true
+        go-version: ${{ matrix.go-version }}
+
+    - name: Test
+      run: |
+        go run core/semver/semver.go -f json
+        make test
+        make cover
