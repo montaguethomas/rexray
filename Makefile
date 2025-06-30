@@ -315,7 +315,11 @@ push-docker-plugin:
 ifeq (1,$(DOCKER_PLUGIN_$(DOCKER_DRIVER)_NOPUSH))
 	echo "docker plugin push disabled"
 else
+ifneq (,$(DOCKER_USER))
+ifneq (,$(DOCKER_PASS))
 	@docker login -u $(DOCKER_USER) -p $(DOCKER_PASS)
+endif
+endif
 ifeq (unstable,$(DOCKER_PLUGIN_TYPE))
 	sudo docker plugin create $(DOCKER_PLUGIN_NAME_UNSTABLE) $(DOCKER_PLUGIN_BUILD_PATH)
 	docker plugin push $(DOCKER_PLUGIN_NAME_UNSTABLE)
