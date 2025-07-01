@@ -104,8 +104,7 @@ func init() {
 	r.Key(gofig.String, "", "", "", ConfigAzureClientSecretKey)
 	r.Key(gofig.String, "", "", "", ConfigAzureCertPathKey)
 	r.Key(gofig.Bool, "", DefaultUseHTTPS, "", ConfigAzureUseHTTPSKey)
-	r.Key(gofig.String, "", "",
-		"Tag prefix for Azure naming", ConfigAzureTagKey)
+	r.Key(gofig.String, "", "", "Tag prefix for Azure naming", ConfigAzureTagKey)
 
 	gofigCore.Register(r)
 }

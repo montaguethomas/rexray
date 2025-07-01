@@ -3,26 +3,28 @@ package storage
 import (
 	"bytes"
 	"crypto/md5"
-	"crypto/rsa"
-	"crypto/x509"
 	"encoding/binary"
 	"fmt"
 	"hash"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	gofig "github.com/akutz/gofig/types"
 	"github.com/akutz/goof"
 	"github.com/rubiojr/go-vhd/vhd"
 
-	armCompute "github.com/Azure/azure-sdk-for-go/arm/compute"
-	blobStorage "github.com/Azure/azure-sdk-for-go/storage"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/resourcemanager/compute/armcompute/v6"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	autorest "github.com/Azure/go-autorest/autorest/azure"
-
-	"golang.org/x/crypto/pkcs12"
 
 	"github.com/rexray/rexray/libstorage/api/context"
 	"github.com/rexray/rexray/libstorage/api/registry"
@@ -130,8 +132,8 @@ func (d *driver) Init(context types.Context, config gofig.Config) error {
 const cacheKeyC = "cacheKey"
 
 type azureSession struct {
-	vmClient   *armCompute.VirtualMachinesClient
-	blobClient *blobStorage.BlobStorageClient
+	blobStorageClient    *azblob.Client
+	computeClientFactory *armcompute.ClientFactory
 }
 
 var (
@@ -153,26 +155,8 @@ func writeHkey(h hash.Hash, ps *string) {
 var (
 	errLoginMsg           = "Failed to login to Azure"
 	errAuthFailed         = goof.New(errLoginMsg)
-	invalideRsaPrivateKey = goof.New(
-		"PKCS#12 certificate must contain an RSA private key")
+	invalideRsaPrivateKey = goof.New("PKCS#12 certificate must contain an RSA private key")
 )
-
-func decodePkcs12(
-	pkcs []byte,
-	password string) (*x509.Certificate, *rsa.PrivateKey, error) {
-
-	privateKey, certificate, err := pkcs12.Decode(pkcs, password)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rsaPrivateKey, isRsaKey := privateKey.(*rsa.PrivateKey)
-	if !isRsaKey {
-		return nil, nil, invalideRsaPrivateKey
-	}
-
-	return certificate, rsaPrivateKey, nil
-}
 
 func mustSession(ctx types.Context) *azureSession {
 	return context.MustSession(ctx).(*azureSession)
@@ -187,7 +171,7 @@ func (d *driver) Login(ctx types.Context) (interface{}, error) {
 		hkey     = md5.New()
 		ckey     string
 		certData []byte
-		spt      *autorest.ServicePrincipalToken
+		cred     azcore.TokenCredential
 		err      error
 	)
 
@@ -198,79 +182,57 @@ func (d *driver) Login(ctx types.Context) (interface{}, error) {
 	ckey = fmt.Sprintf("%x", hkey.Sum(nil))
 
 	if session, ok := sessions[ckey]; ok {
-		ctx.WithField(cacheKeyC, ckey).Debug(
-			"using cached azure client")
+		ctx.WithField(cacheKeyC, ckey).Debug("using cached azure client")
 		return session, nil
 	}
 
 	if d.clientSecret != "" {
 		ctx.Info("Authenticating via clientSecret")
-	} else {
+		cred, err = azidentity.NewClientSecretCredential(d.tenantID, d.clientID, d.clientSecret, nil)
+		if err != nil {
+			return nil, goof.WithError("Failed to create Service Principal Token with client ID and secret", err)
+		}
+	} else if d.certPath != "" {
 		ctx.Info("Authenticating via client certificate")
-		certData, err = ioutil.ReadFile(d.certPath)
+		certData, err = os.ReadFile(d.certPath)
 		if err != nil {
-			return nil, goof.WithError(
-				"Failed to read provided certificate file",
-				err)
+			return nil, goof.WithError("Failed to read provided certificate file", err)
 		}
-	}
 
-	oauthConfig, err := autorest.PublicCloud.OAuthConfigForTenant(
-		d.tenantID)
-	if err != nil {
-		return nil, goof.WithError(
-			"Failed to create OAuthConfig for tenant", err)
-	}
-
-	if d.clientSecret != "" {
-		spt, err = autorest.NewServicePrincipalToken(
-			*oauthConfig, d.clientID, d.clientSecret,
-			autorest.PublicCloud.ResourceManagerEndpoint)
+		certificates, rsaPrivateKey, err := azidentity.ParseCertificates(certData, nil)
 		if err != nil {
-			return nil, goof.WithError(
-				"Failed to create Service Principal Token"+
-					" with client ID and secret", err)
+			return nil, goof.WithError("Failed to decode certificate data", err)
+		}
+
+		cred, err = azidentity.NewClientCertificateCredential(d.tenantID, d.clientID, certificates, rsaPrivateKey, nil)
+		if err != nil {
+			return nil, goof.WithError("Failed to create Service Principal Token with certificate", err)
 		}
 	} else {
-		certificate, rsaPrivateKey, err := decodePkcs12(certData, "")
+		ctx.Info("Authenticating via default credentials")
+		cred, err = azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			return nil, goof.WithError(
-				"Failed to decode certificate data", err)
-		}
-
-		spt, err = autorest.NewServicePrincipalTokenFromCertificate(
-			*oauthConfig, d.clientID, certificate,
-			rsaPrivateKey,
-			autorest.PublicCloud.ResourceManagerEndpoint)
-		if err != nil {
-			return nil, goof.WithError(
-				"Failed to create Service Principal Token"+
-					" with certificate ", err)
+			return nil, goof.WithError("Failed to obtain credential", err)
 		}
 	}
 
-	newVMC := armCompute.NewVirtualMachinesClient(d.subscriptionID)
-	newVMC.Authorizer = spt
-	newVMC.PollingDelay = 5 * time.Second
-
-	// Verify login is working by listing VMs
-	_, err = newVMC.List(d.resourceGroup)
-	if err != nil {
-		return nil, goof.WithError("Login does not appear functional",
-			err)
+	if _, err := cred.GetToken(ctx, policy.TokenRequestOptions{}); err != nil {
+		return nil, goof.WithError("Login does not appear functional", err)
 	}
 
-	bc, err := blobStorage.NewBasicClient(
-		d.storageAccount,
-		d.storageAccessKey)
+	blobStorageClient, err := azblob.NewClient(fmt.Sprintf("https://%s.blob.core.windows.net/", d.storageAccount), cred, nil)
 	if err != nil {
-		return nil, goof.WithError(
-			"Failed to create BlobStorage client", err)
+		return nil, goof.WithError("Failed to create BlobStorage client", err)
 	}
-	newBC := bc.GetBlobService()
+
+	computeClientFactory, err := armcompute.NewClientFactory(d.subscriptionID, cred, nil)
+	if err != nil {
+		return nil, goof.WithError("Failed to create compute client", err)
+	}
+
 	session := azureSession{
-		blobClient: &newBC,
-		vmClient:   &newVMC,
+		blobStorageClient:    blobStorageClient,
+		computeClientFactory: computeClientFactory,
 	}
 	sessions[ckey] = &session
 
@@ -309,16 +271,22 @@ func (d *driver) Volumes(
 	ctx types.Context,
 	opts *types.VolumesOpts) ([]*types.Volume, error) {
 
-	list, err := mustSession(ctx).blobClient.ListBlobs(d.container,
-		blobStorage.ListBlobsParameters{Include: "metadata"})
-	if err != nil {
-		return nil, goof.WithError("error listing blobs", err)
+	pager := mustSession(ctx).blobStorageClient.NewListBlobsFlatPager(d.container,
+		&container.ListBlobsFlatOptions{Include: container.ListBlobsInclude{Metadata: true}})
+
+	var blobs []*container.BlobItem
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, goof.WithError("error listing blobs", err)
+		}
+		blobs = append(blobs, resp.Segment.BlobItems...)
 	}
+
 	// Convert retrieved volumes to libStorage types.Volume
-	vols, convErr := d.toTypesVolume(ctx, list.Blobs, opts.Attachments)
+	vols, convErr := d.toTypesVolume(ctx, blobs, opts.Attachments)
 	if convErr != nil {
-		return nil, goof.WithError(
-			"error converting to types.Volume", convErr)
+		return nil, goof.WithError("error converting to types.Volume", convErr)
 	}
 	return vols, nil
 }
@@ -356,11 +324,9 @@ func (d *driver) VolumeCreate(ctx types.Context, volumeName string,
 		"sizeInBytes": size,
 	}
 
-	blobClient := mustSession(ctx).blobClient
-	err := d.createDiskBlob(volumeName, size, blobClient)
+	err := d.createDiskBlob(ctx, volumeName, size)
 	if err != nil {
-		return nil, goof.WithFieldsE(fields,
-			"failed to create volume for VM", err)
+		return nil, goof.WithFieldsE(fields, "failed to create volume for VM", err)
 	}
 
 	return d.getVolume(ctx, volumeName, types.VolAttNone)
@@ -394,19 +360,11 @@ func (d *driver) VolumeSnapshot(
 }
 
 // VolumeRemove removes a volume.
-func (d *driver) VolumeRemove(
-	ctx types.Context,
-	volumeID string,
-	opts *types.VolumeRemoveOpts) error {
-
+func (d *driver) VolumeRemove(ctx types.Context, volumeID string, opts *types.VolumeRemoveOpts) error {
 	//TODO check if volume is attached? if so fail
-
-	_, err := mustSession(ctx).blobClient.DeleteBlobIfExists(
-		d.container, volumeID, nil)
+	_, err := mustSession(ctx).blobStorageClient.DeleteBlob(ctx, d.container, volumeID, nil)
 	if err != nil {
-		fields := map[string]interface{}{
-			"volumeID": volumeID,
-		}
+		fields := map[string]interface{}{"volumeID": volumeID}
 		return goof.WithFieldsE(fields, "error removing volume", err)
 	}
 	return nil
@@ -419,13 +377,8 @@ var (
 
 // VolumeAttach attaches a volume and provides a token clients can use
 // to validate that device has appeared locally.
-func (d *driver) VolumeAttach(
-	ctx types.Context,
-	volumeID string,
-	opts *types.VolumeAttachOpts) (*types.Volume, string, error) {
-
+func (d *driver) VolumeAttach(ctx types.Context, volumeID string, opts *types.VolumeAttachOpts) (*types.Volume, string, error) {
 	vmName := context.MustInstanceID(ctx).ID
-
 	fields := map[string]interface{}{
 		"vmName":   vmName,
 		"volumeID": volumeID,
@@ -437,8 +390,7 @@ func (d *driver) VolumeAttach(
 		if _, ok := err.(*types.ErrNotFound); ok {
 			return nil, "", err
 		}
-		return nil, "", goof.WithFieldsE(fields,
-			"failed to get volume for attach", err)
+		return nil, "", goof.WithFieldsE(fields, "failed to get volume for attach", err)
 	}
 	// Check if volume is already attached
 	// TODO: maybe add the check that new instance is the same as current
@@ -448,31 +400,27 @@ func (d *driver) VolumeAttach(
 			return nil, "", errVolAlreadyAttached
 		}
 		for _, att := range volume.Attachments {
-			err = d.detachDisk(ctx, &volumeID, &att.InstanceID.ID)
+			err = d.detachDisk(ctx, volumeID, att.InstanceID.ID)
 			if err != nil {
-				return nil, "", goof.WithError(
-					"failed to detach volume first", err)
+				return nil, "", goof.WithError("failed to detach volume first", err)
 			}
 		}
 	}
 
 	vm, err := d.getVM(ctx, vmName)
 	if err != nil {
-		return nil, "", goof.WithFieldsE(fields,
-			"VM could not be obtained", err)
+		return nil, "", goof.WithFieldsE(fields, "VM could not be obtained", err)
 	}
 
 	lun, err := d.attachDisk(ctx, volumeID, volume.Size, vm)
 	if err != nil {
-		return nil, "", goof.WithFieldsE(fields,
-			"failed to attach volume", err)
+		return nil, "", goof.WithFieldsE(fields, "failed to attach volume", err)
 	}
 
 	volume, err = d.getVolume(ctx, volumeID,
 		types.VolumeAttachmentsRequested)
 	if err != nil {
-		return nil, "", goof.WithFieldsE(fields,
-			"failed to get just created/attached volume", err)
+		return nil, "", goof.WithFieldsE(fields, "failed to get just created/attached volume", err)
 	}
 
 	return volume, lun, nil
@@ -481,13 +429,8 @@ func (d *driver) VolumeAttach(
 var errVolAlreadyDetached = goof.New("volume already detached")
 
 // VolumeDetach detaches a volume.
-func (d *driver) VolumeDetach(
-	ctx types.Context,
-	volumeID string,
-	opts *types.VolumeDetachOpts) (*types.Volume, error) {
-
+func (d *driver) VolumeDetach(ctx types.Context, volumeID string, opts *types.VolumeDetachOpts) (*types.Volume, error) {
 	vmName := context.MustInstanceID(ctx).ID
-
 	fields := map[string]interface{}{
 		"vmName":   vmName,
 		"volumeID": volumeID,
@@ -506,7 +449,7 @@ func (d *driver) VolumeDetach(
 		return nil, errVolAlreadyDetached
 	}
 
-	err = d.detachDisk(ctx, &volumeID, &vmName)
+	err = d.detachDisk(ctx, volumeID, vmName)
 	if err != nil {
 		return nil, err
 	}
@@ -622,7 +565,7 @@ var errGetLocDevs = goof.New("error getting local devices from context")
 
 func (d *driver) toTypesVolume(
 	ctx types.Context,
-	blobs []blobStorage.Blob,
+	blobs []*container.BlobItem,
 	attachments types.VolumeAttachmentsTypes) ([]*types.Volume, error) {
 
 	var (
@@ -630,7 +573,7 @@ func (d *driver) toTypesVolume(
 		ldOK    bool
 		volumes []*types.Volume
 		iid     *types.InstanceID
-		vmDisks []armCompute.DataDisk
+		vmDisks []*armcompute.DataDisk
 	)
 
 	if attachments.Devices() {
@@ -643,10 +586,9 @@ func (d *driver) toTypesVolume(
 		iid = context.MustInstanceID(ctx)
 		vm, err := d.getVM(ctx, iid.ID)
 		if err != nil {
-			return nil, goof.WithError(
-				"Unable to lookup devices on VM", err)
+			return nil, goof.WithError("Unable to lookup devices on VM", err)
 		}
-		vmDisks = *vm.VirtualMachineProperties.StorageProfile.DataDisks
+		vmDisks = vm.Properties.StorageProfile.DataDisks
 	}
 
 	// Metadata can have these fields:
@@ -659,32 +601,32 @@ func (d *driver) toTypesVolume(
 
 	for _, blob := range blobs {
 
-		btype := blob.Metadata["microsoftazurecompute_disktype"]
-		if btype == "" && !strings.HasSuffix(blob.Name, vhdExtension) {
+		btype := *blob.Metadata["microsoftazurecompute_disktype"]
+		if btype == "" && !strings.HasSuffix(*blob.Name, vhdExtension) {
 			continue
 		}
 		if btype == "OSDisk" {
 			continue
 		}
 
-		bName := strings.TrimSuffix(blob.Name, vhdExtension)
+		bName := strings.TrimSuffix(*blob.Name, vhdExtension)
 
 		volume := &types.Volume{
 			Name: bName,
-			ID:   blob.Name,
+			ID:   *blob.Name,
 			Type: btype,
-			Size: blob.Properties.ContentLength / size1GB,
+			Size: *blob.Properties.ContentLength / size1GB,
 			// TODO:
 			//AvailabilityZone: *volume.AvailabilityZone,
-			//Encrypted:        *volume.Encrypted,
+			Encrypted: *blob.Properties.ServerEncrypted,
 		}
 
 		if attachments.Requested() {
 			var attachedVols []*types.VolumeAttachment
-			attVM := blob.Metadata["microsoftazurecompute_vmname"]
+			attVM := *blob.Metadata["microsoftazurecompute_vmname"]
 			if attVM != "" {
 				att := &types.VolumeAttachment{
-					VolumeID: blob.Name,
+					VolumeID: *blob.Name,
 					InstanceID: &types.InstanceID{
 						ID:     attVM,
 						Driver: azureud.Name,
@@ -692,10 +634,7 @@ func (d *driver) toTypesVolume(
 				}
 				if attachments.Devices() {
 					if iid.ID == attVM {
-						att.DeviceName = getDevice(
-							ctx, vmDisks, &bName,
-							ld.DeviceMap,
-						)
+						att.DeviceName = getDevice(ctx, vmDisks, &bName, ld.DeviceMap)
 					}
 				}
 				attachedVols = append(attachedVols, att)
@@ -714,7 +653,7 @@ func getLunStr(lun int32) string {
 
 func getDevice(
 	ctx types.Context,
-	vmDisks []armCompute.DataDisk,
+	vmDisks []*armcompute.DataDisk,
 	bName *string,
 	devMap map[string]string) string {
 
@@ -746,19 +685,16 @@ func (d *driver) diskURI(name string) string {
 	return uri
 }
 
-func (d *driver) getVM(ctx types.Context, name string) (
-	*armCompute.VirtualMachine, error) {
-
-	vm, err := mustSession(ctx).vmClient.Get(d.resourceGroup, name, "")
-	if err != nil {
-		fields := map[string]interface{}{
-			"vmName": name,
-		}
-		return nil, goof.WithFieldsE(
-			fields, "failed to get virtual machine", err)
+func (d *driver) getVM(ctx types.Context, name string) (*armcompute.VirtualMachine, error) {
+	fields := map[string]interface{}{
+		"vmName": name,
 	}
-
-	return &vm, nil
+	vmClient := mustSession(ctx).computeClientFactory.NewVirtualMachinesClient()
+	resp, err := vmClient.Get(ctx, d.resourceGroup, name, nil)
+	if err != nil {
+		return nil, goof.WithFieldsE(fields, "failed to get virtual machine", err)
+	}
+	return &resp.VirtualMachine, nil
 }
 
 func (d *driver) getVolume(
@@ -766,73 +702,69 @@ func (d *driver) getVolume(
 	volumeID string,
 	attachments types.VolumeAttachmentsTypes) (*types.Volume, error) {
 
-	list, err := mustSession(ctx).blobClient.ListBlobs(d.container,
-		blobStorage.ListBlobsParameters{
-			Prefix:  volumeID,
-			Include: "metadata"})
-	if err != nil {
-		return nil, goof.WithError("error listing blobs", err)
+	pager := mustSession(ctx).blobStorageClient.NewListBlobsFlatPager(d.container,
+		&container.ListBlobsFlatOptions{
+			Prefix:  &volumeID,
+			Include: container.ListBlobsInclude{Metadata: true},
+		})
+
+	var blobs []*container.BlobItem
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, goof.WithError("error listing blobs", err)
+		}
+		blobs = append(blobs, resp.Segment.BlobItems...)
 	}
-	if len(list.Blobs) == 0 {
+
+	if len(blobs) == 0 {
 		return nil, apiUtils.NewNotFoundError(volumeID)
 	}
-	if len(list.Blobs) > 1 {
+	if len(blobs) > 1 {
 		return nil, goof.New("multiple volumes found")
 	}
+
 	// Convert retrieved volumes to libStorage types.Volume
-	vols, err := d.toTypesVolume(ctx, list.Blobs, attachments)
+	vols, err := d.toTypesVolume(ctx, blobs, attachments)
 	if err != nil {
 		return nil, goof.WithError("failed to convert volume", err)
 	}
 	return vols[0], nil
 }
 
-func (d *driver) createDiskBlob(
-	name string,
-	size int64,
-	blobClient *blobStorage.BlobStorageClient) error {
+func (d *driver) createDiskBlob(ctx types.Context, name string, size int64) error {
+	pageBlobClient := mustSession(ctx).blobStorageClient.ServiceClient().NewContainerClient(d.container).NewPageBlobClient(name)
+
+	// create VHD signature
+	vhdHeader := vhd.CreateFixedHeader(uint64(size), &vhd.VHDOptions{})
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.BigEndian, vhdHeader); err != nil {
+		return goof.WithError("Vhd header could not be created.", err)
+	}
+	header := buf.Bytes()
 
 	// create new blob
 	vhdSize := size + vhd.VHD_HEADER_SIZE
-	err := blobClient.PutPageBlob(d.container, name, vhdSize, nil)
-	if err != nil {
+	if _, err := pageBlobClient.Create(ctx, vhdSize, nil); err != nil {
 		return goof.WithError("PageBlob could not be created.", err)
 	}
 
 	// add VHD signature
-	h := vhd.CreateFixedHeader(uint64(size), &vhd.VHDOptions{})
-	b := new(bytes.Buffer)
-	err = binary.Write(b, binary.BigEndian, h)
+	_, err := pageBlobClient.UploadPages(ctx,
+		streaming.NopCloser(bytes.NewReader(header[:vhd.VHD_HEADER_SIZE])),
+		blob.HTTPRange{Offset: size, Count: vhd.VHD_HEADER_SIZE}, nil)
 	if err != nil {
-		d.deleteDiskBlob(name, blobClient)
-		return goof.WithError("Vhd header could not be created.", err)
-	}
-	header := b.Bytes()
-	err = blobClient.PutPage(d.container, name, size, vhdSize-1,
-		blobStorage.PageWriteTypeUpdate,
-		header[:vhd.VHD_HEADER_SIZE], nil)
-	if err != nil {
-		d.deleteDiskBlob(name, blobClient)
-		return goof.WithError(
-			"Vhd header could not be updated in the blob.", err)
+		mustSession(ctx).blobStorageClient.DeleteBlob(ctx, d.container, name, nil)
+		return goof.WithError("Vhd header could not be updated in the blob.", err)
 	}
 
 	return nil
 }
 
-func (d *driver) deleteDiskBlob(
-	blobName string,
-	blobClient *blobStorage.BlobStorageClient) error {
-
-	return blobClient.DeleteBlob(d.container, blobName, nil)
-}
-
-func (d *driver) getNextDiskLun(
-	vm *armCompute.VirtualMachine) (int32, error) {
-
+func (d *driver) getNextDiskLun(vm *armcompute.VirtualMachine) (int32, error) {
 	// 64 is a max number of LUNs per VM
 	used := make([]bool, 64)
-	disks := *vm.StorageProfile.DataDisks
+	disks := vm.Properties.StorageProfile.DataDisks
 	for _, disk := range disks {
 		if disk.Lun != nil {
 			used[*disk.Lun] = true
@@ -846,48 +778,42 @@ func (d *driver) getNextDiskLun(
 	return -1, goof.New("Free Lun could not be found.")
 }
 
-func (d *driver) attachDisk(
-	ctx types.Context,
-	volumeName string,
-	size int64,
-	vm *armCompute.VirtualMachine) (string, error) {
-
+func (d *driver) attachDisk(ctx types.Context, volumeName string, size int64, vm *armcompute.VirtualMachine) (string, error) {
 	lun, err := d.getNextDiskLun(vm)
 	if err != nil {
-		return "", goof.WithError(
-			"Could not find find an empty Lun to attach disk to.",
-			err)
+		return "", goof.WithError("Could not find find an empty Lun to attach disk to.", err)
 	}
 
 	uri := d.diskURI(volumeName)
-	disks := *vm.StorageProfile.DataDisks
+	disks := vm.Properties.StorageProfile.DataDisks
 	sizeGB := int32(size)
-	disks = append(disks,
-		armCompute.DataDisk{
-			Name:         &volumeName,
-			Vhd:          &armCompute.VirtualHardDisk{URI: &uri},
-			Lun:          &lun,
-			CreateOption: armCompute.Attach,
-			DiskSizeGB:   &sizeGB,
-			// TODO:
-			// Caching:      cachingMode,
-		})
-	newVM := armCompute.VirtualMachine{
+	disks = append(disks, &armcompute.DataDisk{
+		Name:         &volumeName,
+		Vhd:          &armcompute.VirtualHardDisk{URI: &uri},
+		Lun:          &lun,
+		CreateOption: to.Ptr(armcompute.DiskCreateOptionTypesAttach),
+		DiskSizeGB:   &sizeGB,
+		// TODO:
+		// Caching:      cachingMode,
+	})
+	newVM := armcompute.VirtualMachine{
 		Location: vm.Location,
-		VirtualMachineProperties: &armCompute.VirtualMachineProperties{
-			StorageProfile: &armCompute.StorageProfile{
-				DataDisks: &disks,
+		Properties: &armcompute.VirtualMachineProperties{
+			StorageProfile: &armcompute.StorageProfile{
+				DataDisks: disks,
 			},
 		},
 	}
 
-	_, err = mustSession(ctx).vmClient.CreateOrUpdate(d.resourceGroup,
-		*vm.Name, newVM, nil)
+	poller, err := mustSession(ctx).computeClientFactory.NewVirtualMachinesClient().
+		BeginCreateOrUpdate(ctx, d.resourceGroup, *vm.Name, newVM, nil)
+	if err != nil {
+		return "", goof.WithError("failed to request volume attachment to VM", err)
+	}
+	_, err = poller.PollUntilDone(ctx, nil)
 	if err != nil {
 		detail := err.Error()
-		if strings.Contains(detail,
-			"Code=\"AcquireDiskLeaseFailed\"") {
-
+		if strings.Contains(detail, "Code=\"AcquireDiskLeaseFailed\"") {
 			// if lease cannot be acquired, immediately detach
 			// the disk and return the original error
 			ctx.Info("failed to acquire disk lease, try detach")
@@ -899,21 +825,17 @@ func (d *driver) attachDisk(
 	return getLunStr(lun), nil
 }
 
-func (d *driver) detachDisk(
-	ctx types.Context,
-	volumeID *string,
-	vmName *string) error {
-
-	vm, err := d.getVM(ctx, *vmName)
+func (d *driver) detachDisk(ctx types.Context, volumeID string, vmName string) error {
+	vm, err := d.getVM(ctx, vmName)
 	if err != nil {
 		return goof.WithError("VM could not be obtained", err)
 	}
 
 	found := false
-	disks := *vm.StorageProfile.DataDisks
+	disks := vm.Properties.StorageProfile.DataDisks
 	for i, disk := range disks {
 		// Disk is paged blob in Azure. So blob name is case sensitive.
-		if disk.Name != nil && *disk.Name == *volumeID {
+		if disk.Name != nil && *disk.Name == volumeID {
 			ctx.Debugf("Removing %v from VM", volumeID)
 			// found the disk
 			disks = append(disks[:i], disks[i+1:]...)
@@ -924,19 +846,23 @@ func (d *driver) detachDisk(
 	if !found {
 		return goof.New("VolumeID not found on given instance")
 	}
-	newVM := armCompute.VirtualMachine{
+	newVM := armcompute.VirtualMachine{
 		Location: vm.Location,
-		VirtualMachineProperties: &armCompute.VirtualMachineProperties{
-			StorageProfile: &armCompute.StorageProfile{
-				DataDisks: &disks,
+		Properties: &armcompute.VirtualMachineProperties{
+			StorageProfile: &armcompute.StorageProfile{
+				DataDisks: disks,
 			},
 		},
 	}
 
-	_, err = mustSession(ctx).vmClient.CreateOrUpdate(
-		d.resourceGroup, *vmName, newVM, nil)
+	poller, err := mustSession(ctx).computeClientFactory.NewVirtualMachinesClient().
+		BeginCreateOrUpdate(ctx, d.resourceGroup, *vm.Name, newVM, nil)
 	if err != nil {
-		return goof.WithError("failed to detach volume", err)
+		return goof.WithError("failed to request volume detachment from VM", err)
+	}
+	_, err = poller.PollUntilDone(ctx, nil)
+	if err != nil {
+		return goof.WithError("failed to detach volume from VM", err)
 	}
 
 	return nil
