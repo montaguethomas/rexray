@@ -4,7 +4,7 @@ go 1.24.4
 
 require (
 	github.com/Azure/azure-sdk-for-go v7.0.1-beta+incompatible
-	github.com/Azure/go-autorest v7.2.5+incompatible
+	github.com/Azure/go-autorest v7.3.1+incompatible
 	github.com/SermoDigital/jose v0.9.2-0.20161205224733-f6df55f235c2
 	github.com/akutz/gofig v0.1.9
 	github.com/akutz/golf v0.1.3
@@ -48,12 +48,11 @@ require (
 	cloud.google.com/go/auth v0.16.1 // indirect
 	cloud.google.com/go/auth/oauth2adapt v0.2.8 // indirect
 	cloud.google.com/go/compute/metadata v0.7.0 // indirect
-	github.com/Masterminds/semver v1.5.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2 // indirect
 	github.com/coreos/go-systemd v0.0.0-20191104093116-d3cd4ed1dbcf // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
-	github.com/dgrijalva/jwt-go v3.2.0+incompatible // indirect
+	github.com/dgrijalva/jwt-go v0.0.0-00010101000000-000000000000 // indirect
 	github.com/docker/go-connections v0.5.0 // indirect
 	github.com/fatih/color v1.18.0 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
@@ -61,6 +60,7 @@ require (
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-viper/mapstructure/v2 v2.3.0 // indirect
+	github.com/golang-jwt/jwt/v4 v4.5.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/go-querystring v1.1.0 // indirect
@@ -105,6 +105,7 @@ require (
 
 replace (
 	github.com/appropriate/go-virtualboxclient => github.com/clintonskitson/go-virtualboxclient v0.0.0-20151220033032-e0978ab2ed40
+	github.com/dgrijalva/jwt-go => github.com/golang-jwt/jwt/v4 v4.5.1
 	github.com/jteeuwen/go-bindata => github.com/akutz/go-bindata v3.0.8-0.20160412065030-1dd44b25b79c+incompatible
 	github.com/rubiojr/go-vhd => github.com/codenrhoden/go-vhd v0.0.0-20170208185941-96a0db67ea82
 	github.com/sirupsen/logrus => github.com/akutz/logrus v0.8.7-0.20170830210741-d842de504ca8
