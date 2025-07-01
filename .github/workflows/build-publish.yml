@@ -118,6 +118,8 @@ jobs:
       run: make build-docker-plugin
 
     - name: Push Docker Plugin
+      env:
+        DOCKER_PLUGIN_TYPE: ${{ github.event_name != 'pull_request' && 'staged' || 'unstable' }}
       run: make push-docker-plugin
 
     - name: Add Latest Tag
